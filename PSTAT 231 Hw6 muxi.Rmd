@@ -1,0 +1,293 @@
+---
+title: "PSTAT 231 Hw6 muxi"
+author: "muxi"
+date: "2022-11-26"
+output: html_document
+---
+
+## Exercise 1
+
+```{r echo=TRUE, warning=FALSE}
+library(tidymodels)
+library(ISLR)
+library(ISLR2)
+library(tidyverse)
+tidymodels_prefer()
+library(janitor)
+library(pROC)
+library(rpart.plot)
+library(vip)
+library(janitor)
+library(randomForest)
+library(corrr)
+library(corrplot)
+library(xgboost)
+library(ranger)
+```
+
+```{r echo=TRUE}
+#Use clean_names
+data=read.csv("Pokemon.csv")%>%clean_names()
+#Filter out the rarer Pokémon types
+data=data %>% filter(type_1=="Bug"|type_1=="Fire"|type_1=="Grass"|type_1=="Normal"|type_1=="Water"|type_1=="Psychic")
+#Convert type_1 and legendary to factors
+data[,3]=as.factor(data[,3])
+data[,12]=as.factor(data[,12])
+data[,13]=as.factor(data[,13])
+#Do an initial split of the data
+set.seed(1215)
+data_split=initial_split(data, strata = type_1, prop = 0.7)
+data_train=training(data_split)
+data_test=testing(data_split)
+#Fold the training set using v-fold cross-validation
+data_folds=vfold_cv(data_train, v = 5,strata = type_1)
+#Set up a recipe
+Pokemon_recipe=recipe(type_1 ~ legendary+generation+sp_atk+attack+speed+defense+hp+sp_def, data = data_train) %>% step_dummy(legendary,generation)%>%step_center(all_predictors())%>%step_scale(all_predictors())
+
+```
+
+## Exercise 2
+
+```{r echo=TRUE}
+data_train %>% select(where(is.numeric)) %>% select(-total) %>% select(-x)%>% cor() %>% corrplot(type = 'lower', method = 'color')
+```
+
+I removed the Total predictor. By the definition of	Total: sum of all stats that come after this, a general guide to how strong a pokemon is, we know that the sum of all the other variables is a perfect predictor of Total.
+
+We notice that SP Def has a strong positive correlation with defense. In my opinion, these two predictors both reveal Pokémon's defensive properties.
+
+## Exercise 3
+
+```{r echo=TRUE}
+# model
+class_tree_spec=decision_tree() %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+# workflow
+class_tree_wf <- workflow() %>%
+  add_model(class_tree_spec %>% set_args(cost_complexity = tune())) %>%
+  add_recipe(Pokemon_recipe)
+#tune
+param_grid <- grid_regular(cost_complexity(range = c(-3, -1)), levels = 10)
+#fit
+tune_res <- tune_grid(
+  class_tree_wf, 
+  resamples = data_folds, 
+  grid = param_grid, 
+  metrics = metric_set(roc_auc)
+)
+autoplot(tune_res)
+```
+
+From the graph, we could see that the roc_auc keeps stable and then decreasing as Cost-Complexity Parameter increases. It is clear that a single decision tree don't perform better with a smaller or larger complexity penalty. The roc_auc reaches the highest value at Cost-Complexity Parameter = 0.03 approximately.
+
+## Exercise 4
+
+```{r echo=TRUE, warning=FALSE}
+#Best roc_auc
+collect_metrics(tune_res)%>% arrange(-mean)
+```
+
+From the graph, we could see that the roc_auc of my best-performing pruned decision tree on the folds is 0.6688242.
+
+## Exercise 5
+
+```{r echo=TRUE}
+#fit
+best_complexity=select_best(tune_res)
+class_tree_final=finalize_workflow(class_tree_wf, best_complexity)
+class_tree_final_fit=fit(class_tree_final, data = data_train)
+#visualize 
+class_tree_final_fit %>%
+  extract_fit_engine() %>%
+  rpart.plot(roundint=FALSE)
+```
+
+## Exercise 5
+
+```{r echo=TRUE}
+#model
+rf_spec=rand_forest(mtry = tune(),trees=tune(),min_n=tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# workflow
+rf_wf=workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(Pokemon_recipe)
+```
+
+mtry: An integer indicating how many predictors will be sampled at random for the tree models at each split.
+
+trees: An integer representing how many trees are included in the ensemble.
+
+min_n: An integer representing the minimal quantity of data points in a node necessary for the node to be further divided.
+
+```{r echo=TRUE}
+#Create the regular grid
+para_grid=grid_regular(mtry(range = c(1, 8)),trees(range = c(1, 8)),min_n(range = c(4, 32)), levels = c(mtry = 8, trees = 8,min_n=8))
+```
+
+As mtry is equal to the number of predictors. We have to fit a model type1 ~ legendary, generation, sp_atk, attack, speed, defense, hp, and sp_def. Hence, we totally have 8 predictors and the maximum value of mtry is 8.
+
+## Exercise 6
+
+```{r echo=TRUE}
+#fit
+rf_res=tune_grid(
+  rf_wf,
+  resamples = data_folds, 
+  grid = para_grid,
+  metrics = metric_set(roc_auc)
+)
+autoplot(rf_res)
+```
+
+From all graphs we could see that models with higher trees preform better. Moreover, the curves become more smooth as min_n increases. What's more, the roc_aucs gradually increase with the value of mtry in all graphs. 
+
+mtry=8,min_n=24,trees=7 seem to yield the best performance.
+
+## Exercise 7
+
+```{r echo=TRUE}
+# Best roc_auc
+collect_metrics(rf_res)%>% arrange(-mean)
+```
+
+The roc_auc of the best-performing random forest model on the folds is 0.7166293.
+
+## Exercise 8
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+#fit
+rf_best_para=select_best(rf_res, metric = "roc_auc")
+rf_final=finalize_workflow(rf_wf, rf_best_para)
+rf_final_fit=fit(rf_final, data = data_train)
+augment(rf_final_fit, new_data = data_train) %>%
+  accuracy(truth = type_1, estimate = .pred_class)
+#vip(rf_final_fit)
+```
+
+## Exercise 9
+
+```{r echo=TRUE}
+boost_spec=boost_tree(trees = tune(), tree_depth = 4) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+boost_wf=workflow() %>%
+  add_model(boost_spec) %>%
+  add_recipe(Pokemon_recipe)
+
+para_grid=grid_regular(trees(range = c(10,1000)), levels = c(trees = 10))
+
+boost_res=tune_grid(
+  boost_wf,
+  resamples = data_folds, 
+  grid = para_grid,
+  metrics = metric_set(roc_auc)
+)
+autoplot(boost_res)
+
+```
+
+```{r echo=TRUE, warning=FALSE}
+collect_metrics(boost_res)%>% arrange(-mean)
+```
+
+The roc_auc of the best-performing boosted tree model on the folds is 0.7264726.
+
+## Exercise 10
+
+```{r echo=TRUE, warning=FALSE}
+ROC_AUC=c(0.6688242, 0.7166293, 0.7264726)
+models=c("pruned tree", "random forest", "boosted tree")
+results=tibble(ROC_AUC = ROC_AUC, models = models)
+results %>% 
+  arrange(-ROC_AUC)
+```
+
+Boosted tree models performed best on the folds. 
+
+```{r echo=TRUE}
+best_para=select_best(boost_res, metric = "roc_auc")
+final=finalize_workflow(boost_wf, best_para)
+final_fit=fit(final, data = data_test)
+k1=predict(final_fit, data_test, type="prob")
+k2=predict(final_fit, data_test, type="class")
+k3=cbind(k1,k2)
+Pre=cbind(data_test[,3],k3)
+Pre %>%roc_auc(data_test[,3],  .pred_Bug: .pred_Water)
+augment(final_fit, new_data = data_test) %>%
+  conf_mat(truth = type_1, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+Pre %>%
+  roc_curve(data_test[,3],  .pred_Bug: .pred_Water) %>%
+  autoplot()
+
+```
+
+All classes was predicted prefectly by the model due to overfitting.
+
+## Exercise 11
+
+```{r echo=TRUE}
+abadata=read.csv("abalone.csv")
+abadata=mutate(abadata,age=rings+1.5)
+abadata_split = initial_split(abadata, prop = 0.80)
+abadata_train = training(abadata_split)
+abadata_test = testing(abadata_split)
+train=select(abadata_train,-c(rings))
+test=select(abadata_test,-c(rings))
+
+abadata_recipe = recipe(age~ ., data = train)
+recipe=abadata_recipe%>% 
+  step_dummy(all_nominal_predictors())%>% 
+  step_interact(terms = ~ starts_with("type"):shucked_weight)%>% 
+  step_interact(terms = ~ longest_shell:diameter)%>% 
+  step_interact(terms = ~ shucked_weight:shell_weight)%>% 
+  step_center(all_nominal_predictors())%>% 
+  step_scale(all_nominal_predictors())
+
+abarf_spec=rand_forest(mtry = tune(),trees=tune(),min_n=tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+# workflow
+abarf_wf=workflow() %>%
+  add_model(abarf_spec) %>%
+  add_recipe(recipe)
+
+para_grid=grid_regular(mtry(range = c(1, 8)),trees(range = c(1, 8)),min_n(range = c(4, 32)), levels = c(mtry = 8, trees = 8,min_n=8))
+
+abadata_folds=vfold_cv(train, v = 5,strata = age)
+
+aba_res=tune_grid(
+  abarf_wf,
+  resamples = abadata_folds, 
+  grid = para_grid,
+  metrics = metric_set(rmse)
+)
+autoplot(aba_res)
+
+```
+
+```{r echo=TRUE}
+collect_metrics(aba_res)%>% arrange(-mean)
+```
+
+```{r echo=TRUE}
+best_para=select_best(aba_res, metric = "rmse")
+abarf=finalize_workflow(abarf_wf, best_para)
+abarf_fit=fit(abarf, data = train)
+augment(abarf_fit, new_data = test) %>%
+  rmse(truth = age, estimate = .pred)
+```
+
+
+
+
+
+
+
